@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""Delete Signal Desktop messages older than N days.
+
+Supports macOS, Linux (native, Flatpak, Snap), and Windows.
+Requires sqlcipher CLI.
+
+Usage:
+    signal-desktop-expire --days 90
+    signal-desktop-expire --days 90 --db /path/to/db.sqlite --config /path/to/config.json
+"""
+
+import argparse
+import base64
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+except ImportError:
+    sys.exit("Requires: pip install cryptography")
+
+VERSION = "0.2.0"
+
+# Platform detection
+PLATFORM = sys.platform
+if PLATFORM.startswith("linux"):
+    PLATFORM = "linux"
+
+
+def get_signal_dir() -> Path:
+    """Find Signal Desktop data directory."""
+    if PLATFORM == "darwin":
+        return Path.home() / "Library/Application Support/Signal"
+    elif PLATFORM == "linux":
+        # Check in order: native, Flatpak, Snap
+        candidates = [
+            Path.home() / ".config/Signal",
+            Path.home() / ".var/app/org.signal.Signal/config/Signal",
+            Path.home() / "snap/signal-desktop/current/.config/Signal",
+        ]
+        for path in candidates:
+            if (path / "config.json").exists():
+                return path
+        return candidates[0]  # Default to native path
+    elif PLATFORM == "win32":
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            return Path(appdata) / "Signal"
+        return Path.home() / "AppData/Roaming/Signal"
+    else:
+        sys.exit(f"Unsupported platform: {PLATFORM}")
+
+
+def get_default_paths() -> tuple[Path, Path, Path]:
+    """Return default paths for current platform."""
+    signal_dir = get_signal_dir()
+    return (
+        signal_dir / "sql/db.sqlite",
+        signal_dir / "config.json",
+        signal_dir / "attachments.noindex",
+    )
+
+
+def find_sqlcipher() -> str:
+    """Find sqlcipher binary."""
+    for path in ["/opt/homebrew/bin/sqlcipher", "/usr/local/bin/sqlcipher", "/usr/bin/sqlcipher"]:
+        if os.path.exists(path):
+            return path
+    result = shutil.which("sqlcipher")
+    if result:
+        return result
+    sys.exit("sqlcipher not found. Install with: brew install sqlcipher")
+
+
+def get_keychain_password_macos() -> str:
+    """Get Signal's encryption password from macOS Keychain."""
+    result = subprocess.run(
+        ["security", "find-generic-password", "-s", "Signal Safe Storage", "-w"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        sys.exit("Failed to get Signal keychain password. Is Signal Desktop installed?")
+    return result.stdout.strip()
+
+
+def get_keychain_password_linux() -> str:
+    """Get Signal's encryption password from Linux secret storage."""
+    # Try secret-tool (libsecret CLI, works with GNOME Keyring)
+    if shutil.which("secret-tool"):
+        result = subprocess.run(
+            ["secret-tool", "lookup", "xdg:schema", "chrome_libsecret_os_crypt_password_v2", "application", "Signal"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout:
+            return result.stdout.strip()
+
+        # Fallback: try with just application attribute
+        result = subprocess.run(
+            ["secret-tool", "lookup", "application", "Signal"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout:
+            return result.stdout.strip()
+
+    # Try KWallet (KDE)
+    if shutil.which("kwallet-query"):
+        # Get the default wallet name (usually "kdewallet")
+        result = subprocess.run(
+            ["kwalletcli", "-f", "Chromium Keys", "-e", "Chromium Safe Storage"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout:
+            return result.stdout.strip()
+
+        # Try kwallet-query with default wallet
+        for wallet in ["kdewallet", "localwallet"]:
+            result = subprocess.run(
+                ["kwallet-query", "-r", "Chromium Safe Storage", "-f", "Chromium Keys", wallet],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0 and result.stdout:
+                return result.stdout.strip()
+
+    # If both failed, provide helpful error
+    sys.exit(
+        "Failed to get Signal password from secret storage.\n"
+        "For GNOME: install libsecret-tools (apt install libsecret-tools)\n"
+        "For KDE: install kwallet (apt install kwalletcli) or kwallet-query\n"
+        "Make sure Signal Desktop has been run at least once."
+    )
+
+
+def get_windows_key(signal_dir: Path) -> bytes:
+    """Get Signal's encryption key from Windows DPAPI."""
+    local_state_path = signal_dir / "Local State"
+    if not local_state_path.exists():
+        sys.exit(f"Local State file not found: {local_state_path}")
+
+    local_state = json.loads(local_state_path.read_text())
+    encrypted_key_b64 = local_state.get("os_crypt", {}).get("encrypted_key")
+    if not encrypted_key_b64:
+        sys.exit("No encrypted_key in Local State")
+
+    encrypted_key = base64.b64decode(encrypted_key_b64)
+    if not encrypted_key.startswith(b"DPAPI"):
+        sys.exit("Unexpected key format (expected DPAPI prefix)")
+
+    encrypted_key = encrypted_key[5:]  # Strip "DPAPI" prefix
+
+    # Use ctypes to call Windows DPAPI
+    import ctypes
+    import ctypes.wintypes
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", ctypes.wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+
+    blob_in = DATA_BLOB(len(encrypted_key), ctypes.cast(encrypted_key, ctypes.POINTER(ctypes.c_char)))
+    blob_out = DATA_BLOB()
+
+    if not crypt32.CryptUnprotectData(ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)):
+        sys.exit("DPAPI decryption failed")
+
+    key = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    kernel32.LocalFree(blob_out.pbData)
+    return key
+
+
+def decrypt_key_chromium(encrypted_key_hex: str, password: str, iterations: int) -> str:
+    """Decrypt Chromium Safe Storage encrypted key."""
+    encrypted = bytes.fromhex(encrypted_key_hex)
+    prefix = encrypted[:3]
+    if prefix not in (b"v10", b"v11"):
+        sys.exit(f"Unknown encryption version: {prefix}")
+
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA1(), length=16, salt=b"saltysalt", iterations=iterations
+    )
+    derived = kdf.derive(password.encode())
+    cipher = Cipher(algorithms.AES(derived), modes.CBC(b" " * 16))
+    decryptor = cipher.decryptor()
+    decrypted = decryptor.update(encrypted[3:]) + decryptor.finalize()
+    if not decrypted:
+        sys.exit("Decryption produced empty result")
+    pad = decrypted[-1]
+    if not (1 <= pad <= 16) or decrypted[-pad:] != bytes([pad]) * pad:
+        sys.exit("Invalid PKCS#7 padding - wrong password?")
+    return decrypted[:-pad].decode()
+
+
+def decrypt_key_windows(encrypted_key_hex: str, aes_key: bytes) -> str:
+    """Decrypt Signal config key using Windows AES-256-GCM."""
+    encrypted = bytes.fromhex(encrypted_key_hex)
+    prefix = encrypted[:3]
+    if prefix != b"v10":
+        sys.exit(f"Unknown encryption version: {prefix}")
+
+    nonce = encrypted[3:15]  # 12 bytes
+    ciphertext_and_tag = encrypted[15:]
+
+    aesgcm = AESGCM(aes_key)
+    try:
+        decrypted = aesgcm.decrypt(nonce, ciphertext_and_tag, None)
+        return decrypted.decode()
+    except Exception as e:
+        sys.exit(f"AES-GCM decryption failed: {e}")
+
+
+def get_db_key(config_path: Path) -> str:
+    """Get decrypted database key for current platform."""
+    config = json.loads(config_path.read_text())
+    encrypted_key = config.get("encryptedKey")
+    if not encrypted_key:
+        sys.exit(f"No encryptedKey in {config_path}")
+
+    if PLATFORM == "darwin":
+        password = get_keychain_password_macos()
+        return decrypt_key_chromium(encrypted_key, password, iterations=1003)
+    elif PLATFORM == "linux":
+        password = get_keychain_password_linux()
+        return decrypt_key_chromium(encrypted_key, password, iterations=1)
+    elif PLATFORM == "win32":
+        signal_dir = config_path.parent
+        aes_key = get_windows_key(signal_dir)
+        return decrypt_key_windows(encrypted_key, aes_key)
+    else:
+        sys.exit(f"Unsupported platform: {PLATFORM}")
+
+
+def check_signal_running() -> bool:
+    """Check if Signal Desktop is running."""
+    if PLATFORM == "darwin":
+        result = subprocess.run(["pgrep", "-f", "Signal.app"], capture_output=True)
+        return result.returncode == 0
+    elif PLATFORM == "linux":
+        result = subprocess.run(["pgrep", "-f", "signal-desktop"], capture_output=True)
+        return result.returncode == 0
+    elif PLATFORM == "win32":
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq Signal.exe"],
+            capture_output=True,
+            text=True,
+        )
+        return "Signal.exe" in result.stdout
+    return False
+
+
+def run_sql(sqlcipher: str, db_path: Path, db_key: str, sql: str, json_output: bool = False) -> str:
+    """Run SQL against the Signal database."""
+    mode = ".mode json\n" if json_output else ""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".sql", delete=False) as f:
+        f.write(f"PRAGMA key = \"x'{db_key}'\";\nPRAGMA cipher_compatibility = 4;\n{mode}{sql}\n.quit\n")
+        sql_file = f.name
+    try:
+        result = subprocess.run(
+            [sqlcipher, "-init", sql_file, str(db_path)],
+            capture_output=True,
+            text=True,
+            input="",
+        )
+    finally:
+        Path(sql_file).unlink()
+    if "file is not a database" in result.stderr or "file is encrypted" in result.stderr:
+        sys.exit("Database locked or wrong key. Is Signal Desktop running?")
+    return result.stdout
+
+
+def get_old_message_count(sqlcipher: str, db_path: Path, db_key: str, days: int) -> int:
+    """Count messages older than N days."""
+    cutoff_ms = int((days * 24 * 60 * 60) * 1000)
+    sql = f"""
+        SELECT COUNT(*) FROM messages
+        WHERE sent_at < (SELECT MAX(sent_at) - {cutoff_ms} FROM messages);
+    """
+    output = run_sql(sqlcipher, db_path, db_key, sql)
+    for line in output.strip().split("\n"):
+        if line.strip().isdigit():
+            return int(line.strip())
+    return 0
+
+
+def get_attachment_paths_for_old_messages(sqlcipher: str, db_path: Path, db_key: str, days: int) -> set[str]:
+    """Get attachment paths for messages older than N days."""
+    cutoff_ms = int((days * 24 * 60 * 60) * 1000)
+    sql = f"""
+        SELECT path, thumbnailPath, screenshotPath, localBackupPath
+        FROM message_attachments
+        WHERE sentAt < (SELECT MAX(sent_at) - {cutoff_ms} FROM messages);
+    """
+    output = run_sql(sqlcipher, db_path, db_key, sql, json_output=True)
+    paths = set()
+    try:
+        start = output.index("[")
+        end = output.rindex("]") + 1
+        rows = json.loads(output[start:end])
+        for row in rows:
+            for key in ["path", "thumbnailPath", "screenshotPath", "localBackupPath"]:
+                if path := row.get(key):
+                    paths.add(path)
+    except (ValueError, json.JSONDecodeError):
+        pass
+    return paths
+
+
+def delete_messages(sqlcipher: str, db_path: Path, db_key: str, days: int) -> int:
+    """Delete messages older than N days. Returns count deleted."""
+    cutoff_ms = int((days * 24 * 60 * 60) * 1000)
+    sql = f"""
+        DELETE FROM messages
+        WHERE sent_at < (
+            SELECT MAX(sent_at) - {cutoff_ms} FROM messages
+        );
+        SELECT changes();
+    """
+    output = run_sql(sqlcipher, db_path, db_key, sql)
+    for line in output.strip().split("\n"):
+        if line.strip().isdigit():
+            return int(line.strip())
+    return 0
+
+
+def delete_attachments(attachments_dir: Path, paths: set[str], dry_run: bool = False) -> int:
+    """Delete attachment files. Returns count deleted."""
+    deleted = 0
+    for rel_path in paths:
+        full_path = attachments_dir / rel_path
+        if full_path.exists():
+            if dry_run:
+                print(f"  Would delete: {full_path}")
+            else:
+                try:
+                    full_path.unlink()
+                    deleted += 1
+                except OSError as e:
+                    print(f"  Warning: Could not delete {full_path}: {e}", file=sys.stderr)
+    return deleted
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Delete Signal Desktop messages older than N days.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    %(prog)s --days 90                    # Delete messages older than 90 days
+    %(prog)s --days 90 --dry-run          # Show what would be deleted
+    %(prog)s --days 30 --no-attachments   # Delete messages but keep attachments
+        """,
+    )
+    parser.add_argument("--days", "-d", type=int, required=True, help="Delete messages older than N days")
+    parser.add_argument("--db", type=Path, help="Path to Signal db.sqlite (auto-detected by default)")
+    parser.add_argument("--config", type=Path, help="Path to Signal config.json (auto-detected by default)")
+    parser.add_argument("--attachments-dir", type=Path, help="Path to attachments.noindex dir")
+    parser.add_argument("--dry-run", "-n", action="store_true", help="Show what would be deleted without deleting")
+    parser.add_argument("--no-attachments", action="store_true", help="Don't delete attachment files")
+    parser.add_argument("--vacuum", action="store_true", default=True, help="Vacuum database after deletion (default: yes)")
+    parser.add_argument("--no-vacuum", action="store_true", help="Skip database vacuum")
+    parser.add_argument("--force", "-f", action="store_true", help="Run even if Signal appears to be running")
+    parser.add_argument("--version", "-v", action="version", version=f"%(prog)s {VERSION}")
+    args = parser.parse_args()
+
+    if args.days < 1:
+        sys.exit("--days must be at least 1")
+
+    # Get paths
+    default_db, default_config, default_attachments = get_default_paths()
+    db_path = args.db or default_db
+    config_path = args.config or default_config
+    attachments_dir = args.attachments_dir or default_attachments
+
+    # Validate paths
+    if not db_path.exists():
+        sys.exit(f"Database not found: {db_path}")
+    if not config_path.exists():
+        sys.exit(f"Config not found: {config_path}")
+
+    # Check if Signal is running
+    if check_signal_running() and not args.force:
+        sys.exit("Signal Desktop appears to be running. Quit Signal first, or use --force to proceed anyway (may fail).")
+
+    # Find sqlcipher
+    sqlcipher = find_sqlcipher()
+
+    # Get database key
+    print(f"Decrypting database key...")
+    db_key = get_db_key(config_path)
+
+    # Count old messages
+    print(f"Finding messages older than {args.days} days...")
+    message_count = get_old_message_count(sqlcipher, db_path, db_key, args.days)
+    if message_count == 0:
+        print("No messages found to delete.")
+        return
+
+    print(f"Found {message_count} messages to delete.")
+
+    # Get attachment paths before deletion (must do this before DELETE cascades)
+    attachment_paths = set()
+    if not args.no_attachments:
+        print("Finding attachments...")
+        attachment_paths = get_attachment_paths_for_old_messages(sqlcipher, db_path, db_key, args.days)
+        print(f"Found {len(attachment_paths)} attachment files to delete.")
+
+    if args.dry_run:
+        print("\n[DRY RUN] Would delete:")
+        print(f"  - {message_count} messages from database")
+        if attachment_paths:
+            print(f"  - {len(attachment_paths)} attachment files")
+        return
+
+    # Delete messages
+    print(f"Deleting messages from database...")
+    deleted_count = delete_messages(sqlcipher, db_path, db_key, args.days)
+    print(f"Deleted {deleted_count} messages from database.")
+
+    # Delete attachments
+    if attachment_paths and not args.no_attachments:
+        print(f"Deleting attachment files...")
+        deleted_attachments = delete_attachments(attachments_dir, attachment_paths)
+        print(f"Deleted {deleted_attachments} attachment files.")
+
+    # Vacuum to reclaim space
+    if not args.no_vacuum:
+        print("Vacuuming database...")
+        run_sql(sqlcipher, db_path, db_key, "VACUUM;")
+
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
