@@ -27,7 +27,9 @@ try:
 except ImportError:
     sys.exit("Requires: pip install cryptography")
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
+
+SAFETY_THRESHOLD = 0.90  # Abort if deleting more than 90% of messages
 
 # Platform detection
 PLATFORM = sys.platform
@@ -291,6 +293,16 @@ def run_sql(sqlcipher: str, db_path: Path, db_key: str, sql: str, json_output: b
     return result.stdout
 
 
+def get_total_message_count(sqlcipher: str, db_path: Path, db_key: str) -> int:
+    """Count total messages in database."""
+    sql = "SELECT COUNT(*) FROM messages;"
+    output = run_sql(sqlcipher, db_path, db_key, sql)
+    for line in output.strip().split("\n"):
+        if line.strip().isdigit():
+            return int(line.strip())
+    return 0
+
+
 def get_old_message_count(sqlcipher: str, db_path: Path, db_key: str, days: int) -> int:
     """Count messages older than N days."""
     cutoff_ms = int((days * 24 * 60 * 60) * 1000)
@@ -343,7 +355,7 @@ def delete_messages(sqlcipher: str, db_path: Path, db_key: str, days: int) -> in
     return 0
 
 
-def delete_attachments(attachments_dir: Path, paths: set[str], dry_run: bool = False) -> int:
+def delete_attachments(attachments_dir: Path, paths: set[str], dry_run: bool = False, verbose: bool = False) -> int:
     """Delete attachment files. Returns count deleted."""
     deleted = 0
     attachments_resolved = attachments_dir.resolve()
@@ -359,6 +371,8 @@ def delete_attachments(attachments_dir: Path, paths: set[str], dry_run: bool = F
                 try:
                     full_path.unlink()
                     deleted += 1
+                    if verbose:
+                        print(f"  Deleted: {full_path}")
                 except OSError as e:
                     print(f"  Warning: Could not delete {full_path}: {e}", file=sys.stderr)
     return deleted
@@ -384,6 +398,8 @@ Examples:
     parser.add_argument("--vacuum", action="store_true", default=True, help="Vacuum database after deletion (default: yes)")
     parser.add_argument("--no-vacuum", action="store_true", help="Skip database vacuum")
     parser.add_argument("--force", "-f", action="store_true", help="Run even if Signal appears to be running")
+    parser.add_argument("--force-delete-all", action="store_true", help="Allow deleting >90%% of messages (safety override)")
+    parser.add_argument("--verbose", action="store_true", help="List each attachment file as it is deleted")
     parser.add_argument("--version", "-v", action="version", version=f"%(prog)s {VERSION}")
     args = parser.parse_args()
 
@@ -413,14 +429,23 @@ Examples:
     print(f"Decrypting database key...")
     db_key = get_db_key(config_path)
 
-    # Count old messages
+    # Count messages
     print(f"Finding messages older than {args.days} days...")
+    total_count = get_total_message_count(sqlcipher, db_path, db_key)
     message_count = get_old_message_count(sqlcipher, db_path, db_key, args.days)
     if message_count == 0:
         print("No messages found to delete.")
         return
 
-    print(f"Found {message_count} messages to delete.")
+    delete_ratio = message_count / total_count if total_count > 0 else 0
+    print(f"Found {message_count} of {total_count} messages to delete ({delete_ratio:.1%}).")
+
+    # Safety check: abort if deleting too much
+    if delete_ratio > SAFETY_THRESHOLD and not args.force_delete_all:
+        sys.exit(
+            f"Aborting: would delete {delete_ratio:.1%} of all messages (>{SAFETY_THRESHOLD:.0%}).\n"
+            f"Use --force-delete-all to override this safety check."
+        )
 
     # Get attachment paths before deletion (must do this before DELETE cascades)
     attachment_paths = set()
@@ -444,7 +469,7 @@ Examples:
     # Delete attachments
     if attachment_paths and not args.no_attachments:
         print(f"Deleting attachment files...")
-        deleted_attachments = delete_attachments(attachments_dir, attachment_paths)
+        deleted_attachments = delete_attachments(attachments_dir, attachment_paths, verbose=args.verbose)
         print(f"Deleted {deleted_attachments} attachment files.")
 
     # Vacuum to reclaim space
