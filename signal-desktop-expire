@@ -27,7 +27,7 @@ try:
 except ImportError:
     sys.exit("Requires: pip install cryptography")
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 SAFETY_THRESHOLD = 0.90  # Abort if deleting more than 90% of messages
 
@@ -341,12 +341,47 @@ def get_attachment_paths_for_old_messages(sqlcipher: str, db_path: Path, db_key:
 
 
 def delete_messages(sqlcipher: str, db_path: Path, db_key: str, days: int) -> int:
-    """Delete messages older than N days. Returns count deleted."""
+    """Delete messages older than N days. Returns count deleted.
+
+    Signal's messages_on_delete trigger references messages_fts which uses a custom
+    tokenizer (signal_tokenizer) not available in standard sqlcipher. We work around
+    this by dropping the trigger, manually cleaning related tables, deleting messages,
+    then recreating the trigger. The FTS index will have orphaned entries but Signal
+    rebuilds it as needed.
+    """
     cutoff_ms = int((days * 24 * 60 * 60) * 1000)
     sql = f"""
-        DELETE FROM messages
-        WHERE sent_at < (strftime('%s', 'now') * 1000 - {cutoff_ms});
+        -- Drop trigger that references custom FTS tokenizer
+        DROP TRIGGER IF EXISTS messages_on_delete;
+
+        -- Manually clean related tables (what the trigger would do)
+        DELETE FROM sendLogPayloads WHERE id IN (
+            SELECT payloadId FROM sendLogMessageIds WHERE messageId IN (
+                SELECT id FROM messages WHERE sent_at < (strftime('%s', 'now') * 1000 - {cutoff_ms})
+            )
+        );
+        DELETE FROM reactions WHERE messageId IN (
+            SELECT id FROM messages WHERE sent_at < (strftime('%s', 'now') * 1000 - {cutoff_ms})
+        );
+        DELETE FROM storyReads WHERE storyId IN (
+            SELECT storyId FROM messages WHERE sent_at < (strftime('%s', 'now') * 1000 - {cutoff_ms})
+        );
+
+        -- Delete the messages
+        DELETE FROM messages WHERE sent_at < (strftime('%s', 'now') * 1000 - {cutoff_ms});
         SELECT changes();
+
+        -- Recreate trigger
+        CREATE TRIGGER messages_on_delete AFTER DELETE ON messages BEGIN
+            DELETE FROM messages_fts WHERE rowid = old.rowid;
+            DELETE FROM sendLogPayloads WHERE id IN (
+                SELECT payloadId FROM sendLogMessageIds WHERE messageId = old.id
+            );
+            DELETE FROM reactions WHERE rowid IN (
+                SELECT rowid FROM reactions WHERE messageId = old.id
+            );
+            DELETE FROM storyReads WHERE storyId = old.storyId;
+        END;
     """
     output = run_sql(sqlcipher, db_path, db_key, sql)
     for line in output.strip().split("\n"):
