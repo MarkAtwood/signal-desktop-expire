@@ -27,7 +27,7 @@ try:
 except ImportError:
     sys.exit("Requires: pip install cryptography")
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 SAFETY_THRESHOLD = 0.90  # Abort if deleting more than 90% of messages
 
@@ -249,6 +249,29 @@ def get_db_key(config_path: Path) -> str:
         return decrypt_key_windows(encrypted_key, aes_key)
     else:
         sys.exit(f"Unsupported platform: {PLATFORM}")
+
+
+def get_dir_size(path: Path) -> int:
+    """Get total size of directory in bytes."""
+    if not path.exists():
+        return 0
+    total = 0
+    for f in path.rglob("*"):
+        if f.is_file():
+            try:
+                total += f.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def format_size(size_bytes: int) -> str:
+    """Format bytes as human-readable string."""
+    for unit in ["B", "KB", "MB", "GB"]:
+        if abs(size_bytes) < 1024:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} TB"
 
 
 def check_signal_running() -> bool:
@@ -496,6 +519,10 @@ Examples:
             print(f"  - {len(attachment_paths)} attachment files")
         return
 
+    # Record sizes before deletion
+    db_size_before = db_path.stat().st_size
+    attachments_size_before = get_dir_size(attachments_dir) if not args.no_attachments else 0
+
     # Delete messages
     print(f"Deleting messages from database...")
     deleted_count = delete_messages(sqlcipher, db_path, db_key, args.days)
@@ -512,7 +539,18 @@ Examples:
         print("Vacuuming database...")
         run_sql(sqlcipher, db_path, db_key, "VACUUM;")
 
-    print("Done.")
+    # Report space freed
+    db_size_after = db_path.stat().st_size
+    attachments_size_after = get_dir_size(attachments_dir) if not args.no_attachments else 0
+    db_freed = db_size_before - db_size_after
+    attachments_freed = attachments_size_before - attachments_size_after
+    total_freed = db_freed + attachments_freed
+
+    print(f"\nSpace freed:")
+    print(f"  Database:    {format_size(db_freed)}")
+    if not args.no_attachments:
+        print(f"  Attachments: {format_size(attachments_freed)}")
+    print(f"  Total:       {format_size(total_freed)}")
 
 
 if __name__ == "__main__":
